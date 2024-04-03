@@ -275,7 +275,8 @@ struct hnat_ipv4_hnapt {
 	u32 new_dip;
 	u16 new_dport;
 	u16 new_sport;
-	u32 resv1;
+	u16 m_timestamp; /* For mcast*/
+	u16 resv1;
 	u32 resv2;
 	u32 resv3 : 26;
 	u32 act_dp : 6; /* UDF */
@@ -314,8 +315,7 @@ struct hnat_ipv4_dslite {
 	u32 tunnel_dipv6_3;
 
 	u8 flow_lbl[3]; /* in order to consist with Linux kernel (should be 20bits) */
-	u16 priority : 4; /* in order to consist with Linux kernel (should be 8bits) */
-	u16 resv1 : 4;
+	u8 priority;    /* in order to consist with Linux kernel (should be 8bits) */
 	u32 hop_limit : 8;
 	u32 resv2 : 18;
 	u32 act_dp : 6; /* UDF */
@@ -484,9 +484,9 @@ struct foe_entry {
 /* If user wants to change default FOE entry number, both DEF_ETRY_NUM and
  * DEF_ETRY_NUM_CFG need to be modified.
  */
-#define DEF_ETRY_NUM		8192
+#define DEF_ETRY_NUM		16384
 /* feasible values : 16384, 8192, 4096, 2048, 1024 */
-#define DEF_ETRY_NUM_CFG	TABLE_8K
+#define DEF_ETRY_NUM_CFG	TABLE_16K
 /* corresponding values : TABLE_16K, TABLE_8K, TABLE_4K, TABLE_2K, TABLE_1K */
 #define MAX_EXT_DEVS		(0x3fU)
 #define MAX_IF_NUM		64
@@ -537,7 +537,7 @@ struct mtk_hnat {
 
 	/*devices we plays for*/
 	char wan[IFNAMSIZ];
-
+	char lan[IFNAMSIZ];
 	char ppd[IFNAMSIZ];
 	u16 lvid;
 	u16 wvid;
@@ -554,6 +554,8 @@ struct mtk_hnat {
 	struct extdev_entry *ext_if[MAX_EXT_DEVS];
 	struct timer_list hnat_sma_build_entry_timer;
 	struct timer_list hnat_reset_timestamp_timer;
+	struct timer_list hnat_mcast_check_timer;
+	bool ipv6_en;
 };
 
 struct extdev_entry {
@@ -665,12 +667,14 @@ enum FoeIpAct {
 	(skb_hnat_entry(skb) != 0x3fff && skb_hnat_entry(skb) < hnat_priv->foe_etry_num)
 #define FROM_GE_LAN(skb) (skb_hnat_iface(skb) == FOE_MAGIC_GE_LAN)
 #define FROM_GE_WAN(skb) (skb_hnat_iface(skb) == FOE_MAGIC_GE_WAN)
+#define FROM_GE_PPD(skb) (skb_hnat_iface(skb) == FOE_MAGIC_GE_PPD)
 #define FROM_GE_VIRTUAL(skb) (skb_hnat_iface(skb) == FOE_MAGIC_GE_VIRTUAL)
 #define FROM_EXT(skb) (skb_hnat_iface(skb) == FOE_MAGIC_EXT)
 #define FOE_MAGIC_GE_LAN 0x1
 #define FOE_MAGIC_GE_WAN 0x2
 #define FOE_MAGIC_EXT 0x3
 #define FOE_MAGIC_GE_VIRTUAL 0x4
+#define FOE_MAGIC_GE_PPD 0x5
 #define FOE_INVALID 0xf
 #define index6b(i) (0x3fU - i)
 
@@ -688,12 +692,10 @@ enum FoeIpAct {
 #define NR_PPE_PORT 4
 #define NR_QDMA_PORT 5
 #define NR_DISCARD 7
-#if defined(CONFIG_NET_DSA)
-#define IS_LAN(dev) (!strncmp(dev->name, "lan", 3))
-#else
-#define IS_LAN(dev) (!strncmp(dev->name, "eth0", 4))
-#endif
-#define IS_WAN(dev) (!strcmp(dev->name, hnat_priv->wan))
+#define LAN_DEV_NAME hnat_priv->lan
+#define IS_WAN(dev)                                                            \
+	(!strncmp((dev)->name, hnat_priv->wan, strlen(hnat_priv->wan)))
+#define IS_LAN(dev) (!strncmp(dev->name, LAN_DEV_NAME, strlen(LAN_DEV_NAME)))
 #define IS_BR(dev) (!strncmp(dev->name, "br", 2))
 #define IS_WHNAT(dev)							       \
 	((hnat_priv->data->version == MTK_HNAT_V2 &&			       \
@@ -710,6 +712,7 @@ enum FoeIpAct {
 #define IS_IPV6_GRP(x)                                                         \
 	(IS_IPV6_3T_ROUTE(x) | IS_IPV6_5T_ROUTE(x) | IS_IPV6_6RD(x) |          \
 	 IS_IPV4_DSLITE(x))
+#define IS_GMAC1_MODE ((hnat_priv->gmac_num == 1) ? 1 : 0)
 
 #define es(entry) (entry_state[entry->bfib1.state])
 #define ei(entry, end) (hnat_priv->foe_etry_num - (int)(end - entry))
@@ -750,18 +753,41 @@ enum FoeIpAct {
 extern const struct of_device_id of_hnat_match[];
 extern struct mtk_hnat *hnat_priv;
 
+#if defined(CONFIG_NET_DSA_MT7530)
+void hnat_dsa_fill_stag(const struct net_device *netdev,
+			struct foe_entry *entry,
+			struct hnat_hw_path *hw_path,
+			u16 eth_proto, int mape);
+
+static inline bool hnat_dsa_is_enable(struct mtk_hnat *priv)
+{
+	return (priv->wan_dsa_port != NONE_DSA_PORT);
+}
+#else
+static inline void hnat_dsa_fill_stag(const struct net_device *netdev,
+				      struct foe_entry *entry,
+				      struct hnat_hw_path *hw_path,
+				      u16 eth_proto, int mape)
+{
+}
+
+static inline bool hnat_dsa_is_enable(struct mtk_hnat *priv)
+{
+	return false;
+}
+#endif
+
 void hnat_deinit_debugfs(struct mtk_hnat *h);
 int __init hnat_init_debugfs(struct mtk_hnat *h);
 int hnat_register_nf_hooks(void);
 void hnat_unregister_nf_hooks(void);
 int whnat_adjust_nf_hooks(void);
+int mtk_hqos_ptype_cb(struct sk_buff *skb, struct net_device *dev,
+		      struct packet_type *pt, struct net_device *unused);
 extern int dbg_cpu_reason;
 extern int debug_level;
 extern int hook_toggle;
 extern int mape_toggle;
-#if defined(CONFIG_NET_MEDIATEK_HW_QOS)
-extern int hqos_toggle;
-#endif
 
 int ext_if_add(struct extdev_entry *ext_entry);
 int ext_if_del(struct extdev_entry *ext_entry);
@@ -778,4 +804,11 @@ uint32_t foe_dump_pkt(struct sk_buff *skb);
 uint32_t hnat_cpu_reason_cnt(struct sk_buff *skb);
 int hnat_enable_hook(void);
 int hnat_disable_hook(void);
+void hnat_cache_ebl(int enable);
 void set_gmac_ppe_fwd(int gmac_no, int enable);
+int entry_delete(int index);
+
+static inline u16 foe_timestamp(struct mtk_hnat *h)
+{
+	return (readl(hnat_priv->fe_base + 0x0010)) & 0xffff;
+}

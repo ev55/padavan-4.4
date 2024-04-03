@@ -40,11 +40,19 @@ static void hnat_sma_build_entry(unsigned long data)
 	cr_set_field(hnat_priv->ppe_base + PPE_TB_CFG, SMA, SMA_FWD_CPU_BUILD_ENTRY);
 }
 
+void hnat_cache_ebl(int enable)
+{
+	cr_set_field(hnat_priv->ppe_base + PPE_CAH_CTRL, CAH_X_MODE, 1);
+	cr_set_field(hnat_priv->ppe_base + PPE_CAH_CTRL, CAH_X_MODE, 0);
+	cr_set_field(hnat_priv->ppe_base + PPE_CAH_CTRL, CAH_EN, enable);
+}
+
 static void hnat_reset_timestamp(unsigned long data)
 {
 	struct foe_entry *entry;
 	int hash_index;
 
+	hnat_cache_ebl(0);
 	cr_set_field(hnat_priv->ppe_base + PPE_TB_CFG, TCP_AGE, 0);
 	cr_set_field(hnat_priv->ppe_base + PPE_TB_CFG, UDP_AGE, 0);
 	writel(0, hnat_priv->fe_base + 0x0010);
@@ -52,11 +60,14 @@ static void hnat_reset_timestamp(unsigned long data)
 	for (hash_index = 0; hash_index < hnat_priv->foe_etry_num; hash_index++) {
 		entry = hnat_priv->foe_table_cpu + hash_index;
 		if (entry->bfib1.state == BIND)
-			entry->ipv4_hnapt.udib1.time_stamp = 0;
+			entry->bfib1.time_stamp =
+				readl(hnat_priv->fe_base + 0x0010) & (0xFFFF);
 	}
 
 	cr_set_field(hnat_priv->ppe_base + PPE_TB_CFG, TCP_AGE, 1);
 	cr_set_field(hnat_priv->ppe_base + PPE_TB_CFG, UDP_AGE, 1);
+	hnat_cache_ebl(1);
+
 	mod_timer(&hnat_priv->hnat_reset_timestamp_timer, jiffies + 14400 * HZ);
 }
 
@@ -92,14 +103,14 @@ static void exclude_boundary_entry(struct foe_entry *foe_table_cpu)
 	int bad_entry, i, j;
 	struct foe_entry *foe_entry;
 	/*these entries are boundary every 128 entries*/
-	int boundary_entry_offset[7] = { 12, 25, 38, 51, 76, 89, 102 };
+	int boundary_entry_offset[8] = { 12, 25, 38, 51, 76, 89, 102, 115};
 
 	if (!foe_table_cpu)
 		return;
 
 	for (i = 0; entry_base < hnat_priv->foe_etry_num; i++) {
 		/* set boundary entries as static*/
-		for (j = 0; j < 7; j++) {
+		for (j = 0; j < 8; j++) {
 			bad_entry = entry_base + boundary_entry_offset[j];
 			foe_entry = &foe_table_cpu[bad_entry];
 			foe_entry->udib1.sta = 1;
@@ -181,9 +192,7 @@ static int hnat_start(void)
 	writel(0xFFFFFFFF, hnat_priv->ppe_base + PPE_IP_PROT_CHK);
 
 	/* setup caching */
-	cr_set_field(hnat_priv->ppe_base + PPE_CAH_CTRL, CAH_X_MODE, 1);
-	cr_set_field(hnat_priv->ppe_base + PPE_CAH_CTRL, CAH_X_MODE, 0);
-	cr_set_field(hnat_priv->ppe_base + PPE_CAH_CTRL, CAH_EN, 1);
+	hnat_cache_ebl(1);
 
 	/* enable FOE */
 	cr_set_bits(hnat_priv->ppe_base + PPE_FLOW_CFG,
@@ -218,13 +227,13 @@ static int hnat_start(void)
 	cr_set_field(hnat_priv->ppe_base + PPE_BIND_LMT_0, HALF_LMT, 16383);
 	cr_set_field(hnat_priv->ppe_base + PPE_BIND_LMT_1, FULL_LMT, 16383);
 	/* setup binding threshold as 30 packets per second */
-	cr_set_field(hnat_priv->ppe_base + PPE_BNDR, BIND_RATE, 0x1E);
+	cr_set_field(hnat_priv->ppe_base + PPE_BNDR, BIND_RATE, 0x5);
 
 	/* setup FOE cf gen */
 	cr_set_field(hnat_priv->ppe_base + PPE_GLO_CFG, PPE_EN, 1);
 	writel(0, hnat_priv->ppe_base + PPE_DFT_CPORT); /* pdma */
 	/* writel(0x55555555, hnat_priv->ppe_base + PPE_DFT_CPORT); */ /* qdma */
-	cr_set_field(hnat_priv->ppe_base + PPE_GLO_CFG, TTL0_DRP, 1);
+	cr_set_field(hnat_priv->ppe_base + PPE_GLO_CFG, TTL0_DRP, 0);
 
 	/*enable ppe mib counter*/
 	if (hnat_priv->data->per_flow_accounting) {
@@ -281,9 +290,7 @@ static void hnat_stop(void)
 		}
 	}
 	/* disable caching */
-	cr_set_field(hnat_priv->ppe_base + PPE_CAH_CTRL, CAH_X_MODE, 1);
-	cr_set_field(hnat_priv->ppe_base + PPE_CAH_CTRL, CAH_X_MODE, 0);
-	cr_set_field(hnat_priv->ppe_base + PPE_CAH_CTRL, CAH_EN, 0);
+	hnat_cache_ebl(0);
 
 	/* flush cache has to be ahead of hnat disable --*/
 	cr_set_field(hnat_priv->ppe_base + PPE_GLO_CFG, PPE_EN, 0);
@@ -400,14 +407,20 @@ int hnat_disable_hook(void)
 	}
 
 	/* clear HWNAT cache */
-	cr_set_field(hnat_priv->ppe_base + PPE_CAH_CTRL, CAH_X_MODE, 1);
-	cr_set_field(hnat_priv->ppe_base + PPE_CAH_CTRL, CAH_X_MODE, 0);
-	cr_set_field(hnat_priv->ppe_base + PPE_CAH_CTRL, CAH_EN, 1);
+	hnat_cache_ebl(1);
+
 	mod_timer(&hnat_priv->hnat_sma_build_entry_timer, jiffies + 3 * HZ);
 	hook_toggle = 0;
 
 	return 0;
 }
+
+#if (1)
+static struct packet_type mtk_pack_type __read_mostly = {
+	.type   = HQOS_MAGIC_TAG,
+	.func   = mtk_hqos_ptype_cb,
+};
+#endif
 
 static int hnat_probe(struct platform_device *pdev)
 {
@@ -441,9 +454,16 @@ static int hnat_probe(struct platform_device *pdev)
 	strncpy(hnat_priv->wan, (char *)name, IFNAMSIZ);
 	dev_info(&pdev->dev, "wan = %s\n", hnat_priv->wan);
 
+	err = of_property_read_string(np, "mtketh-lan", &name);
+	if (err < 0)
+		strncpy(hnat_priv->lan, "eth2", IFNAMSIZ);
+	else
+		strncpy(hnat_priv->lan, (char *)name, IFNAMSIZ);
+	dev_info(&pdev->dev, "lan = %s\n", hnat_priv->lan);
+
 	err = of_property_read_string(np, "mtketh-ppd", &name);
 	if (err < 0)
-		strncpy(hnat_priv->ppd, "eth0", IFNAMSIZ);
+		strncpy(hnat_priv->ppd, "eth2", IFNAMSIZ);
 	else
 		strncpy(hnat_priv->ppd, (char *)name, IFNAMSIZ);
 	dev_info(&pdev->dev, "ppd = %s\n", hnat_priv->ppd);
@@ -528,6 +548,11 @@ static int hnat_probe(struct platform_device *pdev)
 		add_timer(&hnat_priv->hnat_reset_timestamp_timer);
 	}
 
+#if (1)
+	if (IS_GMAC1_MODE)
+		dev_add_pack(&mtk_pack_type);
+#endif
+
 	return 0;
 
 err_out:
@@ -557,6 +582,11 @@ static int hnat_remove(struct platform_device *pdev)
 	del_timer_sync(&hnat_priv->hnat_sma_build_entry_timer);
 	if (hnat_priv->data->version == MTK_HNAT_V3)
 		del_timer_sync(&hnat_priv->hnat_reset_timestamp_timer);
+
+#if (1)
+	if (IS_GMAC1_MODE)
+		dev_remove_pack(&mtk_pack_type);
+#endif
 
 	return 0;
 }

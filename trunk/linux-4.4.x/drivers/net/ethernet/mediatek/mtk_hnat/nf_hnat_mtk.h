@@ -37,7 +37,7 @@ struct hnat_desc {
 	u32 bssid : 6;
 } __packed;
 
-#if defined(CONFIG_NET_MEDIATEK_HW_QOS)
+#if (1)
 #define HQOS_MAGIC_TAG 0x5678
 #define HAS_HQOS_MAGIC_TAG(skb) (skb->protocol == HQOS_MAGIC_TAG)
 #else

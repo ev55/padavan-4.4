@@ -198,6 +198,11 @@ static void hnat_mcast_nlmsg_handler(struct work_struct *work)
 		nest2 = nla_find_nested(nest, MDBA_MDB_ENTRY);
 		if (nest2) {
 			info = nla_find_nested(nest2, MDBA_MDB_ENTRY_INFO);
+			if (!info) {
+				kfree_skb(skb);
+				continue;
+			}
+
 			entry = (struct br_mdb_entry *)nla_data(info);
 			trace_printk("%s:cmd=0x%2x,ifindex=0x%x,state=0x%x",
 				     __func__, nlh->nlmsg_type,
@@ -246,6 +251,26 @@ out:
 	return NULL;
 }
 
+static void hnat_mcast_check_timestamp(unsigned long data)
+{
+	struct foe_entry *entry;
+	int hash_index;
+	u16 e_ts, foe_ts;
+
+	for (hash_index = 0; hash_index < hnat_priv->foe_etry_num; hash_index++) {
+		entry = hnat_priv->foe_table_cpu + hash_index;
+		if (entry->bfib1.sta == 1) {
+			e_ts = (entry->ipv4_hnapt.m_timestamp) & 0xffff;
+			foe_ts = foe_timestamp(hnat_priv);
+			if ((foe_ts - e_ts) > 0x3000)
+				foe_ts = (~(foe_ts)) & 0xffff;
+			if (abs(foe_ts - e_ts) > 20)
+				entry_delete(hash_index);
+		}
+	}
+	mod_timer(&hnat_priv->hnat_mcast_check_timer, jiffies + 10 * HZ);
+}
+
 int hnat_mcast_enable(void)
 {
 	struct ppe_mcast_table *pmcast;
@@ -269,6 +294,16 @@ int hnat_mcast_enable(void)
 		goto err;
 
 	hnat_priv->pmcast = pmcast;
+
+	/* mt7629 should checkout mcast entry life time manualy */
+	if (hnat_priv->data->version == MTK_HNAT_V3) {
+		init_timer(&hnat_priv->hnat_mcast_check_timer);
+		hnat_priv->hnat_mcast_check_timer.function =
+			hnat_mcast_check_timestamp;
+		hnat_priv->hnat_mcast_check_timer.expires = jiffies;
+		add_timer(&hnat_priv->hnat_mcast_check_timer);
+	}
+
 	/* Enable multicast table lookup */
 	cr_set_field(hnat_priv->ppe_base + PPE_GLO_CFG, MCAST_TB_EN, 1);
 	/* multicast port0 map to PDMA */
@@ -297,6 +332,9 @@ int hnat_mcast_disable(void)
 	struct socket *sock = pmcast->msock;
 	struct workqueue_struct *queue = pmcast->queue;
 	struct work_struct *work = &pmcast->work;
+
+	if (hnat_priv->data->version == MTK_HNAT_V3)
+		del_timer_sync(&hnat_priv->hnat_mcast_check_timer);
 
 	if (pmcast) {
 		flush_work(work);
